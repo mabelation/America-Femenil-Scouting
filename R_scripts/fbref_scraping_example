@@ -1,0 +1,132 @@
+# -------- Paquetes --------
+pkgs <- c("rvest","xml2","dplyr","purrr","janitor","stringr","readr")
+for(p in pkgs) if(!requireNamespace(p, quietly=TRUE)) install.packages(p)
+lapply(pkgs, library, character.only = TRUE)
+
+# -------- Helper: lee una tabla por ID (DOM o comentario) --------
+get_fbref_table_by_id <- function(url, table_id){
+  pg <- read_html(url)
+  
+  # 1) DOM directo
+  node <- html_element(pg, paste0("table#", table_id))
+  if(!inherits(node, "xml_missing")) {
+    df <- html_table(node)
+  } else {
+    # 2) En comentarios HTML
+    comm <- html_nodes(pg, xpath = "//comment()") |> xml_text()
+    hit  <- comm[stringr::str_detect(
+      comm, stringr::regex(paste0('table id="', table_id, '"'), ignore_case = TRUE)
+    )][1]
+    if(is.na(hit)) stop("No hallé la tabla ", table_id, " en: ", url)
+    df <- read_html(hit) |>
+      html_element(paste0("table#", table_id)) |>
+      html_table()
+  }
+  
+  df <- janitor::clean_names(df)
+  
+  # Detectar columna del equipo (squad/team/club)
+  name_col <- names(df)[stringr::str_detect(
+    names(df), stringr::regex("(^|_)squad$|(^|_)team$|(^|_)club$", ignore_case = TRUE)
+  )]
+  if(length(name_col) == 0) name_col <- names(df)[1]  # fallback
+  
+  # Limpiar filas de encabezado repetido y totales
+  df <- df |>
+    dplyr::filter(!is.na(.data[[name_col]])) |>
+    dplyr::filter(!stringr::str_detect(
+      .data[[name_col]], stringr::regex("^squad$|^total$", ignore_case = TRUE)
+    ))
+  
+  # Tipar numéricas
+  num_cols <- setdiff(names(df), name_col)
+  df[num_cols] <- lapply(df[num_cols], readr::parse_number)
+  
+  names(df)[names(df) == name_col] <- "team"
+  df
+}
+
+# -------- URLs/IDs/prefijos (Liga MX 2025-2026) --------
+base <- "https://fbref.com/en/comps/31"
+pages <- list(
+  list(url = paste0(base,"/2025-2026/2025-2026-Liga-MX-Stats"),
+       id  = "stats_squads_standard_for",     pref = "std"),
+  list(url = paste0(base,"/keepers/2025-2026/keepers-2025-2026-Liga-MX"),
+       id  = "stats_squads_keeper_for",       pref = "gk"),
+  list(url = paste0(base,"/keepersadv/2025-2026/keepersadv-2025-2026-Liga-MX"),
+       id  = "stats_squads_keeper_adv_for",   pref = "gk_adv"),
+  list(url = paste0(base,"/shooting/2025-2026/shooting-2025-2026-Liga-MX"),
+       id  = "stats_squads_shooting_for",     pref = "shoot"),
+  list(url = paste0(base,"/passing/2025-2026/passing-2025-2026-Liga-MX"),
+       id  = "stats_squads_passing_for",      pref = "pass"),
+  list(url = paste0(base,"/passing_types/2025-2026/passing_types-2025-2026-Liga-MX"),
+       id  = "stats_squads_passing_types_for",pref = "pass_types"),
+  list(url = paste0(base,"/gca/2025-2026/gca-2025-2026-Liga-MX"),
+       id  = "stats_squads_gca_for",          pref = "gca"),
+  list(url = paste0(base,"/defense/2025-2026/defense-2025-2026-Liga-MX"),
+       id  = "stats_squads_defense_for",      pref = "def"),
+  list(url = paste0(base,"/possession/2025-2026/possession-2025-2026-Liga-MX"),
+       id  = "stats_squads_possession_for",   pref = "poss"),
+  list(url = paste0(base,"/playingtime/2025-2026/playingtime-2025-2026-Liga-MX"),
+       id  = "stats_squads_playing_time_for", pref = "ptime"),
+  list(url  = paste0(base, "/misc/2025-2026/misc-2025-2026-Liga-MX"),
+       id   = "stats_squads_misc_for", pref = "misc")
+)
+
+# -------- Descargar, prefijar y unir --------
+tables_list <- lapply(pages, function(p){
+  df <- tryCatch(get_fbref_table_by_id(p$url, p$id),
+                 error = function(e){ message("Fallo en ", p$pref, ": ", e$message); NULL })
+  if (is.null(df)) return(NULL)
+  cols <- setdiff(names(df), "team")
+  names(df)[match(cols, names(df))] <- paste0(p$pref, "_", cols)
+  df
+})
+
+tables_list <- Filter(Negate(is.null), tables_list)
+stopifnot(length(tables_list) > 0)
+
+liga_mx <- Reduce(function(x, y) dplyr::full_join(x, y, by = "team"), tables_list)
+liga_mx <- liga_mx[, !duplicated(names(liga_mx))] |> dplyr::arrange(team)
+
+# Alias: Team Success -> PPM (si existe en playing time)
+ppm_col <- grep("^ptime_.*ppm$", names(liga_mx), value = TRUE)
+if (length(ppm_col)) liga_mx <- dplyr::rename(liga_mx, team_success_ppm = !!ppm_col[1])
+
+# -------- Exportar --------
+out <- "LigaMX_2025_2026_teams_fbref.csv"
+write.csv(liga_mx, out, row.names = FALSE, na = "")
+cat("CSV listo:", normalizePath(out), "\n")
+
+
+
+### 
+
+
+# -----------------------------
+#  Configuración y utilidades
+# -----------------------------
+options(stringsAsFactors = FALSE)
+library(dplyr)
+library(stringr)
+library(readr)
+
+# 1) Carga del archivo (con acentos)
+ruta <- "LigaMX_2025_2026_teams_fbref.csv"
+df_raw <- read_csv(file = ruta, locale = locale(encoding = "latin1"))
+
+# 2) Normalizar nombres de columnas (minúsculas, guiones bajos)
+names(df_raw) <- names(df_raw) |>
+  tolower() |>
+  str_replace_all("[^a-z0-9]+", "_") |>
+  str_replace_all("^_|_$", "")
+
+# Helper para buscar la PRIMERA columna que haga match con una lista de patrones
+find_col <- function(data, patterns) {
+  cols <- names(data)
+  for (p in patterns) {
+    hit <- cols[str_detect(cols, p)]
+    if (length(hit) > 0) return(hit[1])
+  }
+  return(NA_character_)
+}
